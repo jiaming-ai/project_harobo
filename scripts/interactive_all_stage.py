@@ -11,7 +11,7 @@ from home_robot.core.interfaces import DiscreteNavigationAction, Observations, C
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 sys.path.insert(
-    0, str(Path(__file__).resolve().parent)
+    0, str(Path(__file__).resolve().parent.parent)
 )
 from harobo.agent.ovmm.ovmm_agent import HaroboAgent as OVMMAgent
 from utils.ovmm_env_visualizer import Visualizer

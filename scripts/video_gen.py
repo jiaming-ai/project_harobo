@@ -11,7 +11,7 @@ from home_robot.core.interfaces import DiscreteNavigationAction, Observations, C
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 sys.path.insert(
-    0, str(Path(__file__).resolve().parent)
+    0, str(Path(__file__).resolve().parent.parent)
 )
 from harobo.agent.ovmm.ovmm_agent import HaroboAgent as OVMMAgent
 from utils.ovmm_env_visualizer import Visualizer
@@ -451,7 +451,8 @@ class InteractiveEvaluator():
                     
                 if self.args.save_video and info['ovmm_pick_object_phase_success']:
                     recorder.save_video(fname,result_dir)
-                
+                else:
+                    recorder.clear()
                 # reset env and agent
                 ob = env.reset()
                 agent.reset_vectorized_for_env(

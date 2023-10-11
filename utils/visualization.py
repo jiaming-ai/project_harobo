@@ -343,6 +343,8 @@ class Recording():
         images_to_video(self._images, dir, fname)
         self._images = []
 
+    def clear(self):
+        self._images = []
 
 
 def show_points(points,feats=None):
