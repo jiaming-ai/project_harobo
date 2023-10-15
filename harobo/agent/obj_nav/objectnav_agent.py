@@ -34,6 +34,7 @@ from harobo.navigation_planner.fmm_planner import FMMPlanner
 from harobo.navigation_planner.discrete_planner import add_boundary, remove_boundary, DiscretePlanner
 from harobo.igp_net.predictor import IGPredictor
 import enum
+from .pointnav import PNAgent
 
 # For visualizing exploration issues
 debug_frontier_map = False
@@ -90,6 +91,7 @@ class ObjectNavAgent(Agent):
             np.ceil(agent_radius_cm / config.AGENT.SEMANTIC_MAP.map_resolution)
         )
             
+        self.pn_agent = PNAgent(self.device)
         self.planner = DiscretePlanner(
             turn_angle=config.ENVIRONMENT.turn_angle,
             collision_threshold=config.AGENT.PLANNER.collision_threshold,
@@ -642,6 +644,12 @@ class ObjectNavAgent(Agent):
                     self._terminate_list[e] = True
                     action = DiscreteNavigationAction.STOP
                     
+                # # TEST PN ANGENT
+                # agent_pose = torch.tensor(np.concatenate([obs.gps,obs.compass]))
+                # goal= torch.tensor([2.,0.])
+                # action = self.pn_agent.plan(obs.depth,goal,agent_pose)
+                # print(action)
+
             elif self._state[e] == STATES.CHECKING:
                 # this will transit to state SEARCH if we finish looking around
                 action = self._look_around(e)
@@ -677,55 +685,55 @@ class ObjectNavAgent(Agent):
                     
                     print("hgoal stuck too much, terminate episode")
 
-                # # construct the end rec point cloud if it's present
-                # # We gradually decrease the distance to the rec goal, so that we can determine the best view point
-                # if self._to_end_rec[e] and (not self._terminate_list[e]) and \
-                #     lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
-                #     rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
-                #     # if we are still far from the end goal
-                #     if self.planner.goal_tolerance > 4:
-                #         # if we observe the end rec goal, we add points
-                #         if rec_score > self.end_rec_mask_percent_threshold:
-                #             self.place_policy.add_rec_points(obs)
-                        
-                #         # continue moving towards the end rec goal by decreasing the goal tolerance
-                #         self.planner.goal_tolerance -= 4
-                #         # take some random action and move closer the the end rec goal
-                #         random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
-                #         action = random_action[np.random.randint(2)]
-                #         print(f"Continue to move to end rec with goal threshold {self.planner.goal_tolerance}")
-                #     # if we are close to the end goal
-                #     else:
-                #         print("end rec goal reached with score. Stop")
-                #         action = DiscreteNavigationAction.STOP
-                #         # TODO heurisitc place planning, if failed to find a good placement, we should go to other end rec
-
+                # construct the end rec point cloud if it's present
                 # We gradually decrease the distance to the rec goal, so that we can determine the best view point
                 if self._to_end_rec[e] and (not self._terminate_list[e]) and \
                     lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
                     rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
-                    # if it's a good viewpoint
-                    if rec_score > self.end_rec_mask_percent_threshold:
-                        action = DiscreteNavigationAction.STOP
-                        print(f"end rec goal reached with score {rec_score}")
+                    # if we are still far from the end goal
+                    if self.planner.goal_tolerance > 4:
+                        # if we observe the end rec goal, we add points
+                        if rec_score > self.end_rec_mask_percent_threshold:
+                            self.place_policy.add_rec_points(obs)
+                        
+                        # continue moving towards the end rec goal by decreasing the goal tolerance
+                        self.planner.goal_tolerance -= 4
+                        # take some random action and move closer the the end rec goal
+                        random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
+                        action = random_action[np.random.randint(2)]
+                        print(f"Continue to move to end rec with goal threshold {self.planner.goal_tolerance}")
+                    # if we are close to the end goal
                     else:
-                        if self.planner.goal_tolerance > 2:
-                            self.planner.goal_tolerance -= 2
-                            # take some random action and move closer the the end rec goal
-                            random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
-                            action = random_action[np.random.randint(2)]
-                            print(f"end rec goal not reached, relax goal tolerance to {self.planner.goal_tolerance}")
-                        else:
-                            # try next instance
-                            if  self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][3]):
-                                self._end_rec_ins_idx[e] += 1
-                                self._hgoal_stuck_count[e] = 0
-                                self._update_hgoal_map(e)
-                                action = DiscreteNavigationAction.TURN_RIGHT # take some random action
-                            else:
-                                self._terminate_list[e] = True
-                                action = DiscreteNavigationAction.STOP
-                                print(f"end rec goal not reached, terminate episode")
+                        print("end rec goal reached with score. Stop")
+                        action = DiscreteNavigationAction.STOP
+                        # TODO heurisitc place planning, if failed to find a good placement, we should go to other end rec
+
+                # # We gradually decrease the distance to the rec goal, so that we can determine the best view point
+                # if self._to_end_rec[e] and (not self._terminate_list[e]) and \
+                #     lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
+                #     rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
+                #     # if it's a good viewpoint
+                #     if rec_score > self.end_rec_mask_percent_threshold:
+                #         action = DiscreteNavigationAction.STOP
+                #         print(f"end rec goal reached with score {rec_score}")
+                #     else:
+                #         if self.planner.goal_tolerance > 2:
+                #             self.planner.goal_tolerance -= 2
+                #             # take some random action and move closer the the end rec goal
+                #             random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
+                #             action = random_action[np.random.randint(2)]
+                #             print(f"end rec goal not reached, relax goal tolerance to {self.planner.goal_tolerance}")
+                #         else:
+                #             # try next instance
+                #             if  self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][3]):
+                #                 self._end_rec_ins_idx[e] += 1
+                #                 self._hgoal_stuck_count[e] = 0
+                #                 self._update_hgoal_map(e)
+                #                 action = DiscreteNavigationAction.TURN_RIGHT # take some random action
+                #             else:
+                #                 self._terminate_list[e] = True
+                #                 action = DiscreteNavigationAction.STOP
+                #                 print(f"end rec goal not reached, terminate episode")
                         
             else:
                 raise ValueError("Invalid state")
@@ -775,6 +783,7 @@ class ObjectNavAgent(Agent):
         if self.timesteps[0] % 100 == 99:
             # decay the util_lambda
             self._util_lambda *= 0.95
+        
         
         return action, info
 

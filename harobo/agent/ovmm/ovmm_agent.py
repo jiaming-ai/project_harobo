@@ -14,8 +14,9 @@ from home_robot.agent.ovmm_agent.ovmm_perception import (
 )
 from harobo.agent.ovmm.ovmm_perception import OvmmPerception
 from home_robot.core.interfaces import DiscreteNavigationAction, Observations
-# from home_robot.manipulation import HeuristicPickPolicy
-from .heuristic_pick_policy_video import HeuristicPickPolicy
+from home_robot.manipulation import HeuristicPickPolicy
+# this is for demo video, which slows down the grasping process
+# from .heuristic_pick_policy_video import HeuristicPickPolicy
 from home_robot.perception.constants import RearrangeBasicCategories
 
 
@@ -69,9 +70,9 @@ class HaroboAgent(ObjectNavAgent):
         if config.AGENT.SKILLS.PICK.type == "heuristic" and not self.skip_skills.pick:
             self.pick_policy = HeuristicPickPolicy(config, self.device)
         if config.AGENT.SKILLS.PLACE.type == "heuristic" and not self.skip_skills.place:
-            use_new_place_policy = False
+            use_new_place_policy = True
             if use_new_place_policy:
-                from .heuristic_place_policy import HeuristicPlacePolicy
+                from .heuristic_place_policy_to_be_done import HeuristicPlacePolicy
             else:
                 from home_robot.manipulation import HeuristicPlacePolicy
             self.place_policy = HeuristicPlacePolicy(config, self.device)
@@ -138,8 +139,9 @@ class HaroboAgent(ObjectNavAgent):
             semantic_category_mapping = self.semantic_sensor.current_vocabulary
 
         semantic_frame = np.concatenate(
-            [obs.rgb, obs.semantic[:, :, np.newaxis]], axis=2
+            [obs.task_observations['semantic_frame'], obs.semantic[:, :, np.newaxis]], axis=2
         ).astype(np.uint8)
+        
 
         info = {
             "semantic_frame": semantic_frame,
@@ -586,6 +588,6 @@ class HaroboAgent(ObjectNavAgent):
         except Exception:
             print("Exception occurred. Stopping for the current episode.")
             action = DiscreteNavigationAction.STOP
-            # raise
+            raise
 
         return action, info, obs

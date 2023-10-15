@@ -186,7 +186,7 @@ class DiscretePlanner:
         self.obs_dilation_selem = skimage.morphology.disk(
             self.curr_obs_dilation_selem_radius
         )
-        self.init_min_goal_distance_cm = 50 # reduce the min goal distance since receptacle is not within obstacles
+        self.init_min_goal_distance_cm = 20 # reduce the min goal distance since receptacle is not within obstacles
         self.cur_min_goal_distance_cm = self.init_min_goal_distance_cm
         self.stuck_count = 0
         self.dd_planner = None
@@ -196,7 +196,7 @@ class DiscretePlanner:
         self.last_rid = None
         self.past_poses = []
         self.last_step_getting_out = False
-        self.goal_tolerance =6.1 # we need to stand away from the receptacle to have a better view
+        self.goal_tolerance =16.1 # we need to stand away from the receptacle to have a better view
         self.going_to_rec = True
     def set_vis_dir(self, scene_id: str, episode_id: str):
         self.vis_dir = os.path.join(self.default_vis_dir, f"{scene_id}_{episode_id}")
