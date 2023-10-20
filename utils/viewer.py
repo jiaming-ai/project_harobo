@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from home_robot.core.interfaces import DiscreteNavigationAction
+from home_robot.core.interfaces import DiscreteNavigationAction, ContinuousFullBodyAction
 
 
 class OpenCVViewer:
@@ -25,6 +25,46 @@ class OpenCVViewer:
         elif c == "w":
             # Forward
             action = DiscreteNavigationAction.MOVE_FORWARD
+        elif c == "i":
+            # arm forward
+            joints = np.array(
+                [0.1]
+                + [0] * 3
+                + [0]
+                + [0]
+                + [0] * 4
+            )
+            action = ContinuousFullBodyAction(joints)
+        elif c == "k":
+            # arm backward
+            joints = np.array(
+                [-0.1]
+                + [0] * 3
+                + [0]
+                + [0]
+                + [0] * 4
+            )
+            action = ContinuousFullBodyAction(joints)
+        elif c == "o":
+            # arm up
+            joints = np.array(
+                [0]
+                + [0] * 3
+                + [0.1]
+                + [0]
+                + [0] * 4
+            )
+            action = ContinuousFullBodyAction(joints)
+        elif c == "l":
+            # arm down
+            joints = np.array(
+                [0]
+                + [0] * 3
+                + [-0.1]
+                + [0]
+                + [0] * 4
+            )
+            action = ContinuousFullBodyAction(joints)
         else:
             action = None
 

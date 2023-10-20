@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Tuple
 from collections import deque
 import numpy as np
 from skimage.measure import find_contours
-
+import random
 import time
 import torch
 from torch.nn import DataParallel
@@ -27,6 +27,7 @@ from utils.visualization import (
     render_plt_image,
     visualize_pred,
     show_points, 
+    show_points_with_prob,
     show_voxel_with_prob, 
     show_voxel_with_logit,
     save_img_tensor)    
@@ -149,7 +150,7 @@ class ObjectNavAgent(Agent):
         self._state = [STATES.CHECKING for _ in range(self.num_environments)]
         self._ur_goal_dist = np.zeros(self.num_environments)
         self._global_hgoal_pose = torch.zeros((self.num_environments,self.num_high_goals, 2), device=self.device) # (num_envs, num_goals, 2)
-        self._ur_local_goal_coords = torch.zeros((self.num_environments,self.num_high_goals, 2), device=self.device) # (num_envs, num_goals, 2)
+        # self._ur_local_goal_coords = torch.zeros((self.num_environments,self.num_high_goals, 2), device=self.device) # (num_envs, num_goals, 2)
         self._force_goal_update_once = np.full(self.num_environments, False)
         self._look_around_steps = np.zeros(self.num_environments)
         self._num_explored_grids = np.zeros(self.num_environments)
@@ -172,10 +173,11 @@ class ObjectNavAgent(Agent):
 
         self._to_end_rec = np.zeros(self.num_environments,dtype=bool) # to track if searching for the end receptacle
         self._end_rec_ins_idx = np.zeros(self.num_environments,dtype=int) # to track the instance index of the current goal end receptacle
-        self.end_rec_mask_percent_threshold = 1/8
+        self.end_rec_mask_percent_threshold = 1/12
         
         self.use_instance_based_goal_rec = config.AGENT.IG_PLANNER.use_instance_based_goal_rec
         self._terminate_list = [False for _ in range(self.num_environments)]
+        self._end_rec_view_point = [None for _ in range(self.num_environments)]
         
     def force_update_high_goal(self,e):
         self._force_goal_update_once[e] = True
@@ -238,7 +240,6 @@ class ObjectNavAgent(Agent):
         pred_ig, ig_vis = self._compute_info_gains_igp(e)
         utility_map,local_goal_coords,dist = self._select_goal_igp(e, pred_ig)
         self._ur_goal_dist[e] = dist
-        self._ur_local_goal_coords[e] = local_goal_coords
         self._global_hgoal_pose[e] = self.semantic_map.local_map_coords_to_hab_world_frame(e, local_goal_coords)
         goal_map_e = self._get_goal_map(local_goal_coords)
 
@@ -246,7 +247,8 @@ class ObjectNavAgent(Agent):
             ig_vis['utility'] = render_plt_image(utility_map)
 
         # self._state[e] = STATES.SEARCHING # go to the ur goal
-        self.semantic_map.update_goal_for_env(e, goal_map_e)
+        self.semantic_map.set_goal_for_env(e, goal_map_e)
+        self.semantic_map.set_global_goal_map(e, goal_map_e)
 
         self._hgoal_stuck_count[e] = 0
 
@@ -274,24 +276,23 @@ class ObjectNavAgent(Agent):
         return planner_inputs, planner_outputs
     
     def _update_hgoal_map(self,e):
-        if self._state[e] == STATES.GOING_TO_GOAL:
-            if self._to_end_rec[e]:
-                if self.use_instance_based_goal_rec:
-                    goal_map = self._get_end_rec_goal_map_ins(e,3)
-                else:
-                    goal_map = self._get_end_rec_goal_simple(e,3)
-            else:
-                # goal_map = self._detect_object_goal_simple(e,1,2)
-                # fine grined control over which object to go to
-                goal_coords = self.semantic_map.hab_world_to_map_local_frame(e, self._global_hgoal_pose[e])
-                self._ur_local_goal_coords[e] = goal_coords
-                goal_map = self._get_goal_map(goal_coords)
-        else:
-            goal_coords = self.semantic_map.hab_world_to_map_local_frame(e, self._global_hgoal_pose[e])
-            self._ur_local_goal_coords[e] = goal_coords
-            goal_map = self._get_goal_map(goal_coords)
+        self.semantic_map.update_goal_for_env(e)
+        # if self._state[e] == STATES.GOING_TO_GOAL:
+        #     if self._to_end_rec[e]:
+        #         if self.use_instance_based_goal_rec:
+        #             goal_map = self._get_end_rec_goal_map_ins(e,3)
+        #         else:
+        #             goal_map = self._get_end_rec_goal_simple(e,3)
+        #     else:
+        #         # goal_map = self._detect_object_goal_simple(e,1,2)
+        #         # fine grined control over which object to go to
+        #         goal_coords = self.semantic_map.hab_world_to_map_local_frame(e, self._global_hgoal_pose[e])
+        #         goal_map = self._get_goal_map(goal_coords)
+        # else:
+        #     goal_coords = self.semantic_map.hab_world_to_map_local_frame(e, self._global_hgoal_pose[e])
+        #     goal_map = self._get_goal_map(goal_coords)
 
-        self.semantic_map.update_goal_for_env(e, goal_map)
+        # self.semantic_map.set_goal_for_env(e, goal_map)
 
     def _get_object_goal_ins(self,e,goal_idx,rec_idx=None):
         """
@@ -378,27 +379,133 @@ class ObjectNavAgent(Agent):
 
     def _get_end_rec_goal_map_ins(self,e,end_recep_goal_idx):
         """
-        Instance based goal selection
+        select the best end receptacle for placement globally
+        1. find the end receptacle that is reachable
+        2. for each of the reachable end receptacle, find the instance with the highest score
+        3. check if there is a flat slab on the end receptacle
+
+        if there is a suitable placement, we need to first go close to the end receptacle, and re-generate the point cloud
+        since the acturator is noisy
         """
-        while self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][end_recep_goal_idx]):
-            obj_map_ori = self.semantic_map.local_map[e, MC.NON_SEM_CHANNELS+end_recep_goal_idx].cpu().numpy()
-            instance_bb_global = self.semantic_map.global_instances[e][end_recep_goal_idx][self._end_rec_ins_idx[e]]['bb']
-            lmb = self.semantic_map.lmb[e]
-            instance_bb = [instance_bb_global[0]-lmb[0],instance_bb_global[1]-lmb[0],instance_bb_global[2]-lmb[2],instance_bb_global[3]-lmb[2]]
-            goal_map = np.zeros_like(obj_map_ori)
-            goal_map[instance_bb[0]:instance_bb[1],instance_bb[2]:instance_bb[3]] = \
-                obj_map_ori[instance_bb[0]:instance_bb[1],instance_bb[2]:instance_bb[3]]
+        if len(self.semantic_map.global_instances[e][end_recep_goal_idx]) == 0:
+            return None
+        
+        reachable_end_rec = torch.logical_and(self.semantic_map.global_map[e,MC.NON_SEM_CHANNELS+end_recep_goal_idx]>0.5, \
+            ~self.semantic_map.hgoal_unreachable[e])
+        lmb = self.semantic_map.lmb[e]
+        local_end_rec_map = reachable_end_rec[lmb[0]:lmb[1],lmb[2]:lmb[3]]
+
+        if local_end_rec_map.sum() <= 30:
+            return None
+        
+        polo_reachable = self._compute_reachable_area_to_end_rec(e)
+        local_polo_reachable = polo_reachable[lmb[0]:lmb[1],lmb[2]:lmb[3]]
+        
+        # dialate to find
+        MAX_PLACEMENT_DIST = 10
+        OBS_DIST = 4 # slightly farther so that the object detection can identify the object 
+        
+        obs_map = self.semantic_map.local_map[e,MC.OBSTACLE_MAP].unsqueeze(0)
+        for _ in range(OBS_DIST):
+            obs_map = dialate_tensor(obs_map)
+        obs_map = obs_map[0] > 0
+
+        polo_no_obs = torch.logical_and(local_polo_reachable>1,~obs_map)
+        # dist_map = self._get_dist_map(e)
+        # dist_unreachable = dist_map == dist_map.max()
+
+        # end_rec_ins_all = self.semantic_map.global_instances[e][end_recep_goal_idx]
+        end_rec_ins_all = self.semantic_map.get_ins(e,end_recep_goal_idx)
+        for ins_idx, ins in enumerate(end_rec_ins_all):
             
-            goal_map = goal_map > 0.5
+            # first we find the surrounding area of the end receptacle
+            bb = ins['bb']
+            bb = [bb[0]-lmb[0],bb[1]-lmb[0],bb[2]-lmb[2],bb[3]-lmb[2]]
+            end_rec_map_ins = torch.zeros_like(obs_map).float()
+            end_rec_map_ins[bb[0]:bb[1],bb[2]:bb[3]] = local_end_rec_map[bb[0]:bb[1],bb[2]:bb[3]]
+            
+            # if the receptacle is too small
+            if end_rec_map_ins.sum() <= 20:
+                print(f'end rec {ins_idx} is too small, continue')
+                continue
+            
+            end_rec_map_ins_dia = end_rec_map_ins.clone().unsqueeze(0)
+            for _ in range(MAX_PLACEMENT_DIST):
+                end_rec_map_ins_dia = dialate_tensor(end_rec_map_ins_dia)
+            end_rec_map_ins_dia = end_rec_map_ins_dia[0]
+            
+            # check if 1) navigable 2) not blocked by obstacles
+            reachable_area_ins = torch.logical_and(end_rec_map_ins_dia>0.5, polo_no_obs)
+            
+            # mark to avoid rechecking
+            if reachable_area_ins.sum()<5:
+                print(f'end rec {ins_idx} is unreachable, mark as unreachable and continue')
+                self.semantic_map.mark_end_rec_ins_unreachable(e,ins_idx)
+                continue
 
-            # TODO: use some bigger threshold to filter out small objects
-            # IS this too big?
-            if goal_map.sum() > 30: 
+            reachable_poses = torch.nonzero(reachable_area_ins) # local map coords
+            reachable_poses_global_pose = self.semantic_map.local_map_coords_to_hab_world_frame(e, reachable_poses)
+
+            # TODO: filter out pose that are not navigable
+            
+            # select pose with highest polo score
+            polo_scores = local_polo_reachable[reachable_poses[:,0],reachable_poses[:,1]]
+            polo_idx = torch.argmax(polo_scores)
+            
+            self.place_policy.reset()
+            self.place_policy.set_rec_points([ins['pc']])
+            agent_pose = reachable_poses_global_pose[polo_idx]
+            placement = self.place_policy.get_receptacle_placement_point(agent_pose)
+
+            if placement is not None:
+                goal_map = np.zeros_like(self.semantic_map.goal_map[e])
+                goal_map[reachable_poses[polo_idx,0],reachable_poses[polo_idx,1]] = 1
+                self._end_rec_ins_idx[e] = ins_idx
+
+                # view_point = torch.from_numpy(ins['view_point'][:2]).unsqueeze(0).to(self.device)
+                # view_point_local_map = self.semantic_map.hab_world_to_map_local_frame(e, view_point).cpu().numpy()
+                # goal_map[view_point_local_map[0,0],view_point_local_map[0,1]] = 1
+                self._end_rec_view_point[e] = ins['view_point']
                 return goal_map
-            else:
-                self._end_rec_ins_idx[e] += 1
+            
+            # # sample some points on the reachable area
+            # sampled_idx = random.sample(range(reachable_poses.shape[0]),min(10,reachable_poses.shape[0]))
+            # for point_idx in sampled_idx:
+            
+            #     self.place_policy.reset()
+            #     self.place_policy.set_rec_points([ins['pc']])
+            #     agent_pose = reachable_poses_global_pose[point_idx]
+            #     placement = self.place_policy.get_receptacle_placement_point(agent_pose)
 
+            #     if placement is not None:
+            #         return reachable_area_ins.cpu().numpy()
+
+            else: 
+                print(f'end rec {ins_idx} has no good placement surface, mark as unreachable and continue')
+                self.semantic_map.mark_end_rec_ins_unreachable(e,ins_idx)
+            
         return None
+    # def _get_end_rec_goal_map_ins(self,e,end_recep_goal_idx):
+    #     """
+    #     Instance based goal selection
+    #     find a end rec that has not been marked as unreachable
+    #     """
+    #     end_rec_ins = self.semantic_map.global_instances[e][end_recep_goal_idx]
+    #     reachable_end_rec = torch.logical_and(self.semantic_map.global_map[e,MC.NON_SEM_CHANNELS+end_recep_goal_idx]>0.5, \
+    #         ~self.semantic_map.hgoal_unreachable[e])
+    #     for idx, ins in enumerate(end_rec_ins):
+    #         bb = ins['bb']
+    #         end_rec_ins = reachable_end_rec[bb[0]:bb[1],bb[2]:bb[3]]
+    #         if end_rec_ins.sum() > 30:
+    #             lmb = self.semantic_map.lmb[e]
+    #             global_goal = torch.zeros_like(self.semantic_map.global_map[e,MC.NON_SEM_CHANNELS+end_recep_goal_idx])
+    #             global_goal[bb[0]:bb[1],bb[2]:bb[3]] = end_rec_ins
+    #             goal_map_local = global_goal[lmb[0]:lmb[1],lmb[2]:lmb[3]].cpu().numpy()
+    #             self._end_rec_ins_idx[e] = idx
+    #             print(f'found end rec goal, id: {end_recep_goal_idx}, score: {ins["score"]}')
+    #             return goal_map_local
+    #     return None
+        
     
     def _get_end_rec_goal_simple(self,e,end_recep_goal_idx):
         obj_map_ori = self.semantic_map.local_map[e, MC.NON_SEM_CHANNELS+end_recep_goal_idx]
@@ -406,10 +513,15 @@ class ObjectNavAgent(Agent):
 
         return goal_map
     
-    def _detect_goal(self,e,obs,force_detect=False):
+    def _detect_goal(self,e,obs=None,force_detect=False):
         """
         Detect the goal object and set found goal
         """
+
+        # avoid detecting the same goal again
+        if self._found_goal[e]:
+            return None
+        
         goal_obj_idx,start_rec_idx,end_rec_idx = 1,2,3
         
         goal_map = None
@@ -435,7 +547,8 @@ class ObjectNavAgent(Agent):
       
     def _set_object_goal(self,e,object_goal_map):
 
-        self.semantic_map.update_goal_for_env(e, object_goal_map)
+        self.semantic_map.set_goal_for_env(e, object_goal_map)
+        self.semantic_map.set_global_goal_map(e, object_goal_map)
 
         # calculate the global goal pose
         xs, ys = object_goal_map.nonzero()
@@ -447,6 +560,9 @@ class ObjectNavAgent(Agent):
         self._state[e] = STATES.GOING_TO_GOAL # go to object goal
         self._hgoal_stuck_count[e] = 0
 
+        if self._to_end_rec[0]:
+            self.planner.reset_for_rec()
+
     def _mark_hgoal_unreachable(self,e,mark_radius=5):
         hgoal_global_coords = self.semantic_map.hab_world_to_map_global_frame(e, self._global_hgoal_pose[e])
         x1 = max(0, hgoal_global_coords[e,0] - mark_radius)
@@ -454,12 +570,25 @@ class ObjectNavAgent(Agent):
         y1 = max(0, hgoal_global_coords[e,1] - mark_radius)
         y2 = min(self.semantic_map.global_map.shape[3], hgoal_global_coords[e,1] + mark_radius)
 
-        self.semantic_map.hgoal_unreachable[e,x1:x2,y1:y2] = 1
+        self.semantic_map.hgoal_unreachable[e,x1:x2,y1:y2] = True
 
         # lmb = self.semantic_map.lmb
         # self.semantic_map.local_map[e,MC.OBSTACLE_MAP] = \
         #     self.semantic_map.global_map[e,MC.OBSTACLE_MAP,lmb[e,0]:lmb[e,1], lmb[e,2]:lmb[e,3]]
                                                             
+    def _reset_end_rec_goal(self,e):
+
+        # mark the current end rec as unreachable
+        self.semantic_map.mark_end_rec_ins_unreachable(e,self._end_rec_ins_idx[e])
+        self._found_goal[e] = 0
+        self.place_policy.reset()
+        
+        # find the next end rec
+        goal_map = self._detect_goal(e,force_detect=True)
+        
+        self._hgoal_stuck_count[e] = 0
+        
+        return goal_map
     # ------------------------------------------------------------------
     
     def change_to_rec(self,e, obs):
@@ -469,8 +598,9 @@ class ObjectNavAgent(Agent):
         self._found_goal[e] = 0
         self._to_end_rec[e] = True
 
-        # clear probs in map
+        # clear necessary maps
         self.semantic_map.clear_prob_maps(e)
+        self.semantic_map.clear_hgoal_unreachable(e)
         
         self._state[e] = STATES.SEARCHING
 
@@ -511,6 +641,7 @@ class ObjectNavAgent(Agent):
         # update map
 
         # Update map with observations and generate map features
+        agent_pose = np.concatenate([obs.gps,obs.compass])
         updated_local_map, updated_local_pose, instances = self.module(
             obs_processed,
             pose_delta,
@@ -519,6 +650,7 @@ class ObjectNavAgent(Agent):
             self.semantic_map.local_pose,
             detection_results,
             self.semantic_map.lmb,
+            agent_pose,
         )
 
         for e in range(self.num_environments):
@@ -658,83 +790,73 @@ class ObjectNavAgent(Agent):
                 self._update_hgoal_map(e)
                 lc_input_list[e], lc_output_list[e] = self._call_low_level_planner(e)
                 action = lc_output_list[e]['action']
-                if lc_output_list[e]['end_episode']:
-                    if self._to_end_rec[e] and self.use_instance_based_goal_rec and \
-                        self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][3]):
-                        self._end_rec_ins_idx[e] += 1
-                        self._hgoal_stuck_count[e] = 0
-                        self._update_hgoal_map(e)
+
+                # # view point for end rec
+                # if action == DiscreteNavigationAction.STOP and self._end_rec_view_point[e] is not None:
+                #     delta_angle = self._end_rec_view_point[e][2] - obs.compass
+                #     action = ContinuousNavigationAction(np.array([0,0,delta_angle.item()]))
+
+                # # construct the end rec point cloud if it's present
+                # # We gradually decrease the distance to the rec goal, so that we can determine the best view point
+                # if self._to_end_rec[e] and \
+                #     lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
+                #     rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
+                #     # if we are still far from the end goal
+                #     if self.planner.goal_tolerance > 4:
+                #         # if we observe the end rec goal, we add points
+                #         if rec_score > self.end_rec_mask_percent_threshold:
+                #             self.place_policy.add_rec_points(obs)
+                        
+                #         # continue moving towards the end rec goal by decreasing the goal tolerance
+                #         self.planner.goal_tolerance -= 4
+                #         # take some random action and move closer the the end rec goal
+                #         random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
+                #         action = random_action[np.random.randint(2)]
+                #         print(f"Continue to move to end rec with goal threshold {self.planner.goal_tolerance}")
+                #     # if we are close to the end goal
+                #     else:
+                #         agent_pose = np.concatenate([obs.gps,obs.compass])
+                #         placement = self.place_policy.get_receptacle_placement_point(agent_pose)
+                #         if placement is not None:
+                #             print("end rec goal reached with score. Stop")
+                #             action = DiscreteNavigationAction.STOP
+                #         else:
+                #             print("end rec goal reached with score. No feasible placement point. Go to other end rec")
+                #             #  no feasible placement point, go to other end rec
+                #             self._hgoal_stuck_count[e] = 9 # trigger a replan
+
+                # if cannot go to the current goal because: 
+                # 1) low level planner cannot find a path, 2) stuck too much
+                if self._hgoal_stuck_count[e] % 10 == 9 or lc_output_list[e]['replan_hgoal']:
+                    # for end rec, we can go to the next instance
+                    if self._to_end_rec[e]:
+                        print(f'end rec stuck too much, change to next end rec')
+                        goal_map = self._reset_end_rec_goal(e) 
+                        if goal_map is None:
+                            print(f'no more end rec in the map, continue to explore')
+                            self._state[e] = STATES.SEARCHING
+
                     else:
-                        self._terminate_list[e] = True
-                        action = DiscreteNavigationAction.STOP
+                        # for goal obj, we relax the threshold and continue to move towards the goal
+                        # since there's only one goal obj
+                        # self._terminate_list[e] = True
+                        can_relex = self.planner.relax_goal_tolerance(self._hgoal_stuck_count[e])
+                        if not can_relex:
+                            self._terminate_list[e] = True
+
+                    if action == DiscreteNavigationAction.STOP:
+                        random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
+                        action = random_action[np.random.randint(2)]
                 
-                if self._hgoal_stuck_count[e] % 10 == 9:
-                    if self._to_end_rec[e] and self.use_instance_based_goal_rec and \
-                        self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][3]):
-                        self._end_rec_ins_idx[e] += 1
-                        self._hgoal_stuck_count[e] = 0
-                        self._update_hgoal_map(e)
-                    else:
-                        # we should only do this once
-                        self.planner.relax_goal_tolerance(self._hgoal_stuck_count[e])
-                        print("relax goal tolerance")
-                    
+                # if cannot getout even after relaxing the goal tolerance, or change different end rec
+                # this typically indicate the agent is trapped
+                # we terminate the episode
                 if self._hgoal_stuck_count[e] > 40:
                     self._terminate_list[e] = True
                     action = DiscreteNavigationAction.STOP
-                    
                     print("hgoal stuck too much, terminate episode")
 
-                # construct the end rec point cloud if it's present
-                # We gradually decrease the distance to the rec goal, so that we can determine the best view point
-                if self._to_end_rec[e] and (not self._terminate_list[e]) and \
-                    lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
-                    rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
-                    # if we are still far from the end goal
-                    if self.planner.goal_tolerance > 4:
-                        # if we observe the end rec goal, we add points
-                        if rec_score > self.end_rec_mask_percent_threshold:
-                            self.place_policy.add_rec_points(obs)
-                        
-                        # continue moving towards the end rec goal by decreasing the goal tolerance
-                        self.planner.goal_tolerance -= 4
-                        # take some random action and move closer the the end rec goal
-                        random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
-                        action = random_action[np.random.randint(2)]
-                        print(f"Continue to move to end rec with goal threshold {self.planner.goal_tolerance}")
-                    # if we are close to the end goal
-                    else:
-                        print("end rec goal reached with score. Stop")
-                        action = DiscreteNavigationAction.STOP
-                        # TODO heurisitc place planning, if failed to find a good placement, we should go to other end rec
 
-                # # We gradually decrease the distance to the rec goal, so that we can determine the best view point
-                # if self._to_end_rec[e] and (not self._terminate_list[e]) and \
-                #     lc_output_list[e]['action'] == DiscreteNavigationAction.STOP:
-                #     rec_score = (obs.semantic == obs.task_observations["end_recep_goal"]).sum() / obs.semantic.size
-                #     # if it's a good viewpoint
-                #     if rec_score > self.end_rec_mask_percent_threshold:
-                #         action = DiscreteNavigationAction.STOP
-                #         print(f"end rec goal reached with score {rec_score}")
-                #     else:
-                #         if self.planner.goal_tolerance > 2:
-                #             self.planner.goal_tolerance -= 2
-                #             # take some random action and move closer the the end rec goal
-                #             random_action = [DiscreteNavigationAction.TURN_RIGHT, DiscreteNavigationAction.TURN_LEFT]
-                #             action = random_action[np.random.randint(2)]
-                #             print(f"end rec goal not reached, relax goal tolerance to {self.planner.goal_tolerance}")
-                #         else:
-                #             # try next instance
-                #             if  self._end_rec_ins_idx[e] < len(self.semantic_map.global_instances[e][3]):
-                #                 self._end_rec_ins_idx[e] += 1
-                #                 self._hgoal_stuck_count[e] = 0
-                #                 self._update_hgoal_map(e)
-                #                 action = DiscreteNavigationAction.TURN_RIGHT # take some random action
-                #             else:
-                #                 self._terminate_list[e] = True
-                #                 action = DiscreteNavigationAction.STOP
-                #                 print(f"end rec goal not reached, terminate episode")
-                        
             else:
                 raise ValueError("Invalid state")
                 
@@ -800,9 +922,9 @@ class ObjectNavAgent(Agent):
         self._ur_goal_dist = np.zeros(self.num_environments)
         self._force_goal_update_once = np.full(self.num_environments, False)
         self._global_hgoal_pose = torch.zeros((self.num_environments,self.num_high_goals, 2), device=self.device)
-        self._ur_local_goal_coords = torch.zeros((self.num_environments,self.num_high_goals, 2), 
-                                                 dtype=torch.long,
-                                                 device=self.device)
+        # self._ur_local_goal_coords = torch.zeros((self.num_environments,self.num_high_goals, 2), 
+        #                                          dtype=torch.long,
+        #                                          device=self.device)
         self._look_around_steps = np.zeros(self.num_environments)
         self._num_explored_grids = np.zeros(self.num_environments)
         self._num_promising_grids = np.zeros(self.num_environments)
@@ -818,7 +940,8 @@ class ObjectNavAgent(Agent):
         self._to_end_rec = np.zeros(self.num_environments,dtype=bool) # to track if searching for the end receptacle
         self._end_rec_ins_idx = np.zeros(self.num_environments,dtype=int) # to track the instance index of the current goal end receptacle
         self._terminate_list = [False for _ in range(self.num_environments)]
-
+        self._end_rec_view_point = [None for _ in range(self.num_environments)]
+        
     def reset_vectorized_for_env(self, e: int, episode=None):
         """Initialize agent state for a specific environment."""
         self.timesteps[e] = 0
@@ -830,7 +953,7 @@ class ObjectNavAgent(Agent):
         self._ur_goal_dist[e] = 0
         self._force_goal_update_once[e] = False
         self._global_hgoal_pose[e] = torch.zeros((self.num_high_goals, 2), device=self.device)
-        self._ur_local_goal_coords[e] = torch.zeros((self.num_high_goals, 2), device=self.device).long()
+        # self._ur_local_goal_coords[e] = torch.zeros((self.num_high_goals, 2), device=self.device).long()
         self._look_around_steps[e] = 0
         self._num_explored_grids[e] = 0
         self._num_promising_grids[e] = 0
@@ -847,6 +970,7 @@ class ObjectNavAgent(Agent):
         self._to_end_rec[e] = False
         self._end_rec_ins_idx[e] = 0
         self._terminate_list[e] = False
+        self._end_rec_view_point[e] = None
     # ---------------------------------------------------------------------
     # Inference methods to interact with the robot or a single un-vectorized
     # simulation environment
@@ -914,7 +1038,7 @@ class ObjectNavAgent(Agent):
         agent_rad = self.agent_cell_radius
 
         # we need to make sure the agent is not inside the obstacle
-        while True:
+        while agent_rad < 25:
             traversible = 1 - dilated_obstacles
             start = self.semantic_map.get_local_coords(e)
 
@@ -939,6 +1063,11 @@ class ObjectNavAgent(Agent):
             # check if the agent is inside the obstacle
             if np.unique(fmm_dist).shape[0] > 10:
                 return torch.from_numpy(fmm_dist).float().to(self.device)
+    
+        # if we cannot find a valid dist map, we just return a map with all 1s
+        print("cannot find a valid dist map, return a uniform map")
+        fmm_dist = np.ones_like(dilated_obstacles)
+        return torch.from_numpy(fmm_dist).float().to(self.device)
     
     def _get_goal_map(self,locs:torch.tensor) -> np.ndarray:
         """
@@ -1003,6 +1132,19 @@ class ObjectNavAgent(Agent):
 
         return replan
 
+    def _compute_reachable_area_to_end_rec(self,e):
+        """
+        Use polo network to approximately compute the reachable area to the end rec goal
+        """
+
+        voxel = self.semantic_map.get_global_end_rec_voxel(e)
+        voxel[voxel==0] = -torch.inf
+        voxel[voxel==1] = -13
+        voxel[voxel==2] = 13
+        pred = self.ig_predictor.predict(voxel)
+
+        return pred[1]
+
         
     def _compute_info_gains_igp(self,e):
 
@@ -1019,7 +1161,7 @@ class ObjectNavAgent(Agent):
         pred = self.ig_predictor.predict(voxel)
         # obstacle = self.semantic_map.global_map[e,0] > 0 # [M x M]
         obstacle = self.semantic_map.get_dialated_obstacle_map_global(e,self.ur_obstacle_dialate_radius) # [M x M]
-        unreachable = self.semantic_map.hgoal_unreachable[e] > 0 # [M x M]
+        unreachable = self.semantic_map.hgoal_unreachable[e] # [M x M]
         
         # we add obstacles from collision map
         collision_map = torch.from_numpy(self.planner.collision_map).to(self.device)

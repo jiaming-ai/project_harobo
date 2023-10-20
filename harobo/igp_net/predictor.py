@@ -191,3 +191,28 @@ class IGPredictor():
 
         pred = self.process_pred(pred,xy_proj, x_min, y_min, x_len, y_len)
         return pred
+
+
+    @torch.no_grad()
+    def predict_batch(self,voxel):
+        """
+        args:
+            voxel: torch.tensor, shape: (B, H, M, M)
+        """
+        B = voxel.shape[0]
+        processed_voxel = []
+        processed_ret = []
+        for i in range(B):
+            v,xy_proj, x_min, y_min, x_len, y_len = self._process_voxel(voxel[i])
+            processed_voxel.append(v)
+            processed_ret.append((xy_proj, x_min, y_min, x_len, y_len))
+        voxel = torch.stack(processed_voxel, dim=0)
+        voxel = voxel.to(self.device)
+        pred = self.net(voxel)
+
+        ret = []
+        for i in range(B):
+            xy_proj, x_min, y_min, x_len, y_len = processed_ret[i]
+            pred_i = self.process_pred(pred[i],xy_proj, x_min, y_min, x_len, y_len)
+            ret.append(pred_i)
+        return torch.stack(ret, dim=0)

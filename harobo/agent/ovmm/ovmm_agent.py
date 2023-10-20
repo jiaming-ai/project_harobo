@@ -72,7 +72,7 @@ class HaroboAgent(ObjectNavAgent):
         if config.AGENT.SKILLS.PLACE.type == "heuristic" and not self.skip_skills.place:
             use_new_place_policy = True
             if use_new_place_policy:
-                from .heuristic_place_policy_to_be_done import HeuristicPlacePolicy
+                from .heuristic_place_policy import HeuristicPlacePolicy
             else:
                 from home_robot.manipulation import HeuristicPlacePolicy
             self.place_policy = HeuristicPlacePolicy(config, self.device)
@@ -568,6 +568,12 @@ class HaroboAgent(ObjectNavAgent):
                 else:
                     raise ValueError
 
+
+                if info.get('early_termination', False):
+                    print(f'Early termination at timestep {self.timesteps[0]}')
+                    action = DiscreteNavigationAction.STOP
+                    break
+                
                 # Since heuristic nav is not properly vectorized, this agent currently only supports 1 env
                 # _switch_to_next_skill is thus invoked with e=0
                 if new_state:
@@ -581,9 +587,6 @@ class HaroboAgent(ObjectNavAgent):
             info["curr_skill"] = Skill(self.states[0].item()).name
             print(f'Executing skill {info["curr_skill"]} at timestep {self.timesteps[0]}')
 
-            if info.get('early_termination', False):
-                print(f'Early termination at timestep {self.timesteps[0]}')
-                action = DiscreteNavigationAction.STOP
                 
         except Exception:
             print("Exception occurred. Stopping for the current episode.")

@@ -141,6 +141,7 @@ class POLoMapState:
         self.hgoal_unreachable = torch.zeros(self.num_environments, 
                                             self.global_map_size,
                                             self.global_map_size,
+                                            dtype=torch.bool,
                                             device=self.device)
         
         # Global and local (x, y, o) sensor pose
@@ -166,6 +167,10 @@ class POLoMapState:
         # Binary map encoding agent high-level goal
         self.goal_map = np.zeros(
             (self.num_environments, self.local_map_size, self.local_map_size)
+        )
+        
+        self.global_goal_map = np.zeros(
+            (self.num_environments, self.global_map_size, self.global_map_size)
         )
        
 
@@ -193,7 +198,7 @@ class POLoMapState:
         double_size = self.global_map_size * 2
         double_global_map = torch.zeros(double_size, double_size, device=self.device)
         double_global_map[MC.PROBABILITY_MAP, :, :] = torch.logit(torch.tensor(self.prior))
-        double_global_map[MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :] = -torch.inf # marks as empty
+        double_global_map[MC.VOXEL_START:MC.VOXEL_END, :, :] = -torch.inf # marks as empty
         x1,x2 = self.global_map_size // 2, self.global_map_size // 2 + self.global_map_size
         y1,y2 = self.global_map_size // 2, self.global_map_size // 2 + self.global_map_size
         double_global_map[:, x1:x2, y1:y2] = self.global_map[e]
@@ -247,25 +252,48 @@ class POLoMapState:
         self.global_map[e, MC.PROBABILITY_MAP, :, :] = torch.logit(torch.tensor(self.prior))
         self.local_map[e, MC.PROBABILITY_MAP, :, :] = torch.logit(torch.tensor(self.prior))
         
-        self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :] = -torch.inf # marks as empty
-        self.local_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :] = -torch.inf # marks as empty
+        self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :] = -torch.inf # marks as empty
+        self.local_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :] = -torch.inf # marks as empty
 
-        self.hgoal_unreachable[e] *= 0.0
+        self.hgoal_unreachable[e] = False
         
         self.global_instances[e] = {k:[] for k in range(self.num_sem_categories)}
+        self.global_goal_map[e] = 0
         
     def clear_prob_maps(self,e):
         self.global_map[e, MC.PROBABILITY_MAP, :, :] = torch.logit(torch.tensor(self.prior))
         self.local_map[e, MC.PROBABILITY_MAP, :, :] = torch.logit(torch.tensor(self.prior))
         
-        occupaid_idx = self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :] > - 14
-        self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :][occupaid_idx] = -10
+        occupaid_idx = self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :] > - 14
+        self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :][occupaid_idx] = -10
         
-        occupaid_idx = self.local_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :] > - 14
-        self.local_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :][occupaid_idx] = -10
+        occupaid_idx = self.local_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :] > - 14
+        self.local_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :][occupaid_idx] = -10
         
+    def clear_hgoal_unreachable(self,e):
+        self.hgoal_unreachable[e] = False
 
-    def update_goal_for_env(self, e: int, goal_map: np.ndarray):
+    def mark_end_rec_ins_unreachable(self, e, ins):
+        bb = self.global_instances[e][3][ins]['bb']
+        self.hgoal_unreachable[e, bb[0]:bb[1], bb[2]:bb[3]] = True
+        
+        
+    def set_global_goal_map(self, e, goal_map):
+        """
+        goal_map is a local map
+        """
+        self.global_goal_map[e] = 0
+        lmb = self.lmb[e]
+        self.global_goal_map[e, lmb[0]:lmb[1], lmb[2]:lmb[3]] = goal_map
+    
+    def update_goal_for_env(self, e: int):
+        """
+        update the local goal map using the global goal map and lmb
+        """
+        lmb = self.lmb[e]
+        self.goal_map[e] = self.global_goal_map[e, lmb[0]:lmb[1], lmb[2]:lmb[3]]
+        
+    def set_goal_for_env(self, e: int, goal_map: np.ndarray):
         """Update global goal for a specific environment with the goal action chosen
         by the policy.
 
@@ -347,16 +375,16 @@ class POLoMapState:
     
     def get_local_voxel(self,e) -> torch.tensor:
         """Get local voxel map for an environment."""
-        voxel = self.local_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :].permute(2,1,0).cpu() # [H, W, C]
+        voxel = self.local_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :].permute(2,1,0).cpu() # [H, W, C]
         return voxel
     
     def get_global_voxel(self,e) -> torch.tensor:
         """Get global voxel map for an environment."""
-        return self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :].clone() # [H, M, M]
+        return self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :].clone() # [H, M, M]
 
     def get_local_pointcloud(self, e,transform_to_hab_world_frame=True, to_meter=True) -> torch.tensor:
         """Get cropped local point cloud for an environment."""
-        voxel = self.local_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :]
+        voxel = self.local_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :]
 
         if transform_to_hab_world_frame:
             voxel = voxel.permute(2,1,0)
@@ -374,6 +402,24 @@ class POLoMapState:
             return pc / 100
         return pc
     
+    def get_global_end_rec_voxel(self, e) -> torch.tensor:
+        """Get global voxel map for the end rec"""
+        return self.global_map[e, MC.END_REC_START:MC.END_REC_END, :, :].clone()
+    
+    def get_global_end_rec_pointcloud(self, e) -> torch.tensor:
+        """Get global voxel map for the end rec"""
+        voxel = self.global_map[e, MC.END_REC_START:MC.END_REC_END, :, :]
+        voxel = voxel.permute(2,1,0)
+        idx = torch.nonzero(voxel) # [N, 3]
+        feat = voxel[idx[:,0], idx[:,1], idx[:,2]].unsqueeze(1) # [N, 1]
+        pc = idx.float() # [N, 3]
+        pc[:,:2] -= self.global_map_size / 2
+        pc = pc * self.resolution + self.resolution / 2 # [N, 3]
+        return pc / 100, feat
+        
+    def get_end_rec_ins_pointcloud(self, e, ins_idx) -> torch.tensor:
+        pc = self.global_instances[e][3][ins_idx]['pc']
+        return pc
     def get_global_pointcloud(self, e ) -> torch.tensor:
         """Get global point cloud for an environment.
         returns:
@@ -381,7 +427,7 @@ class POLoMapState:
             feat: tensor of shape [N, 1], prob of occupancy [0, 1]
            
         """
-        voxel = self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :]
+        voxel = self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :]
         voxel = voxel.permute(2,1,0) # in hab world frame (x: forward, y: left, z: up)
         idx = torch.nonzero(~voxel.isinf()) # [N, 3]
         feat = voxel[idx[:,0], idx[:,1], idx[:,2]].unsqueeze(1) # [N, 1]
@@ -397,14 +443,14 @@ class POLoMapState:
         """
         returns: tensor if shape [N, 1] of flat indices of global point cloud, type is long
         """
-        voxel = self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :]
+        voxel = self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :]
         voxel = voxel.permute(2,1,0) # in hab world frame (x: forward, y: left, z: up)
         idx = torch.nonzero(~voxel.isinf()) # [N, 3]
         return idx[:,0] * self.global_map_size * self.global_map_size + idx[:,1] * self.global_map_size + idx[:,2]
         
     def get_num_points(self, e) -> int:
         """Get number of points in global point cloud for an environment."""
-        voxel = self.global_map[e, MC.VOXEL_START:MC.NON_SEM_CHANNELS, :, :]
+        voxel = self.global_map[e, MC.VOXEL_START:MC.VOXEL_END, :, :]
         return torch.sum(~voxel.isinf()).item()
     
     def get_num_explored_cells(self, e) -> int:
@@ -535,26 +581,78 @@ class POLoMapState:
         environment."""
         return self.goal_map[e]
 
+    def get_ins(self,e,ins_idx):
+        """
+        perform nms before returning
+        """
+        rec_bb = [ins['bb'] for ins in self.global_instances[e][ins_idx]]
+        rec_score = [ins['score'] for ins in self.global_instances[e][ins_idx]]
+        picked_idx = nms(rec_bb, rec_score)
+        self.global_instances[e][ins_idx] = [self.global_instances[e][ins_idx][i] for i in picked_idx]
+
+        visualize=False
+
+        if visualize:
+            import matplotlib.pyplot as plt
+            bb_after = [ins['bb'] for ins in self.global_instances[e][ins_idx]]
+            recs = self.local_map[e, MC.NON_SEM_CHANNELS+3, :, :].cpu().numpy()
+            lmb = self.lmb[e].cpu().numpy()
+            bb_local = [[bb[0]-lmb[0], bb[1]-lmb[0], bb[2]-lmb[2], bb[3]-lmb[2]] for bb in bb_after] 
+            plt.imshow(recs)
+            for bbox in bb_local:
+                plt.plot([bbox[2],bbox[2],bbox[3],bbox[3],bbox[2]],[bbox[0],bbox[1],bbox[1],bbox[0],bbox[0]])
+            plt.show()
+
+        return self.global_instances[e][ins_idx]
 
     def update_instances(self,e,new_instances,goal_idx,start_rec_idx,end_rec_idx):
         
-        # TODO we can filter the instances so that we only need to perform the NMS on the instances
-        # that are in the local map
+        self.global_instances[e][goal_idx] += new_instances[goal_idx]
+        self.global_instances[e][start_rec_idx] += new_instances[start_rec_idx]
+        self.global_instances[e][end_rec_idx] += new_instances[end_rec_idx]
         
-        # global NMS
-        # NMS for both recepticles, as we assume a cell can only be occupied by one recepticle object
-        if len(new_instances[start_rec_idx]) > 0 or len(new_instances[end_rec_idx]) > 0:
-            combined_instances = new_instances[start_rec_idx] + new_instances[end_rec_idx] \
-                                + self.global_instances[e][2] + self.global_instances[e][3]
+        # to speed up, we only perform nms when ins_num > 30
+        if len(self.global_instances[e][end_rec_idx]) > 30:
             
-            combined_bb = [ins['bb'] for ins in combined_instances]
-            combined_score = [ins['score'] for ins in combined_instances]
-            combined_class = [ins['class'] for ins in combined_instances]
+            rec_bb = [ins['bb'] for ins in self.global_instances[e][end_rec_idx]]
+            rec_score = [ins['score'] for ins in self.global_instances[e][end_rec_idx]]
+            picked_idx = nms(rec_bb, rec_score)
+            self.global_instances[e][end_rec_idx] = [self.global_instances[e][end_rec_idx][i] for i in picked_idx]
 
-            picked_idx = nms(combined_bb, combined_score)
-            self.global_instances[e][2] = [combined_instances[i] for i in picked_idx if combined_class[i] == start_rec_idx]
-            self.global_instances[e][3] = [combined_instances[i] for i in picked_idx if combined_class[i] == end_rec_idx]
+            # # NMS for both recepticles, as we assume a cell can only be occupied by one recepticle object
+            # combined_instances = new_instances[start_rec_idx] + new_instances[end_rec_idx] \
+            #                     + self.global_instances[e][2] + self.global_instances[e][3]
+            
+            # combined_bb = [ins['bb'] for ins in combined_instances]
+            # combined_score = [ins['score'] for ins in combined_instances]
+            # combined_class = [ins['class'] for ins in combined_instances]
+
+            visualize=False
+            # if visualize:
+            #     import matplotlib.pyplot as plt
+            #     recs = self.global_map[e, MC.NON_SEM_CHANNELS+3, :, :].cpu().numpy() + \
+            #             self.global_map[e, MC.NON_SEM_CHANNELS+2, :, :].cpu().numpy()
+            #     recs = recs > 0
+            #     plt.imshow(recs)
+            #     for bbox in combined_bb:
+            #         plt.plot([bbox[2],bbox[2],bbox[3],bbox[3],bbox[2]],[bbox[0],bbox[1],bbox[1],bbox[0],bbox[0]])
+            #     plt.show()
+
+            # picked_idx = nms(combined_bb, combined_score)
+            # self.global_instances[e][2] = [combined_instances[i] for i in picked_idx if combined_class[i] == start_rec_idx]
+            # self.global_instances[e][3] = [combined_instances[i] for i in picked_idx if combined_class[i] == end_rec_idx]
         
+
+            if visualize:
+                import matplotlib.pyplot as plt
+                bb_after = [ins['bb'] for ins in self.global_instances[e][end_rec_idx]]
+                recs = self.local_map[e, MC.NON_SEM_CHANNELS+3, :, :].cpu().numpy()
+                lmb = self.lmb[e].cpu().numpy()
+                bb_local = [[bb[0]-lmb[0], bb[1]-lmb[0], bb[2]-lmb[2], bb[3]-lmb[2]] for bb in bb_after] 
+                plt.imshow(recs)
+                for bbox in bb_local:
+                    plt.plot([bbox[2],bbox[2],bbox[3],bbox[3],bbox[2]],[bbox[0],bbox[1],bbox[1],bbox[0],bbox[0]])
+                plt.show()
         # NMS for objects
         # TODO: we assume the object class id is 1
         # if len(new_instances[1]) > 0:

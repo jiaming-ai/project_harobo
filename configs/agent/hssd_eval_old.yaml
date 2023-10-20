@@ -80,7 +80,7 @@ AGENT:
       min_joint_delta: 0.02
 
     PICK:
-      type: "heuristic" # or "hardcoded"
+      type: "oracle" # or "hardcoded"
 
     NAV_TO_OBJ:
       type: heuristic # heuristic (default) or rl

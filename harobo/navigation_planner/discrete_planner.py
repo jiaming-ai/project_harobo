@@ -125,8 +125,8 @@ class DiscretePlanner:
         self.timestep = 0
         self.curr_obs_dilation_selem_radius = None
         self.obs_dilation_selem = None
-        self.cur_min_goal_distance_cm = min_goal_distance_cm
-        self.init_min_goal_distance_cm = min_goal_distance_cm
+        self.init_min_goal_distance_cm = 20
+        self.cur_min_goal_distance_cm = self.init_min_goal_distance_cm 
         self.dd = None
 
         self.map_downsample_factor = map_downsample_factor
@@ -186,17 +186,17 @@ class DiscretePlanner:
         self.obs_dilation_selem = skimage.morphology.disk(
             self.curr_obs_dilation_selem_radius
         )
-        self.init_min_goal_distance_cm = 20 # reduce the min goal distance since receptacle is not within obstacles
+        self.init_min_goal_distance_cm = 1 # we want to go as close as possible to the selected rec view point
         self.cur_min_goal_distance_cm = self.init_min_goal_distance_cm
         self.stuck_count = 0
         self.dd_planner = None
         self.navigable_goal_map = None
-        self.max_goal_distance_cm = self.init_max_goal_distance_cm # 80 cm
+        self.max_goal_distance_cm = self.init_max_goal_distance_cm
         
         self.last_rid = None
         self.past_poses = []
         self.last_step_getting_out = False
-        self.goal_tolerance =16.1 # we need to stand away from the receptacle to have a better view
+        # self.goal_tolerance =23.9 # we need to stand away from the receptacle to have a better view
         self.going_to_rec = True
     def set_vis_dir(self, scene_id: str, episode_id: str):
         self.vis_dir = os.path.join(self.default_vis_dir, f"{scene_id}_{episode_id}")
@@ -207,19 +207,29 @@ class DiscretePlanner:
         self.print_images = False
 
     def relax_goal_tolerance(self,rid=None):
+        # THIS iS NEEDED other wise the planner will just stuck at the same place
+        self.cur_min_goal_distance_cm = self.init_min_goal_distance_cm
+
         if self.last_rid is None or self.last_rid != rid:
             # self.goal_tolerance += 2
-            self.collision_map *= 0
-            if self.max_goal_distance_cm < 110:
-                self.max_goal_distance_cm += 10 
-            print(f"Re-planning for object goal, increased goal tolerance to {self.goal_tolerance}")
-
             # Reduce obstacle dilation
             if self.curr_obs_dilation_selem_radius > self.min_obs_dilation_selem_radius:
                 self.curr_obs_dilation_selem_radius -= 1
                 self.obs_dilation_selem = skimage.morphology.disk(self.curr_obs_dilation_selem_radius)
                 print(f"Re-planning for object goal, reduced obs dilation to {self.curr_obs_dilation_selem_radius}")
+
+            self.collision_map *= 0
+
+            if self.max_goal_distance_cm < 110:
+                self.max_goal_distance_cm += 10 
+                
+            else:
+                return False
+
+            print(f"Re-planning for object goal, increased max goal distance to {self.max_goal_distance_cm}")
+
             self.last_rid = rid
+        return True
         
     def plan(
         self,
@@ -333,7 +343,7 @@ class DiscretePlanner:
         # low level stuck get out
         # if the agent can't avoid the obstacle by adding collision map
         # we try to get out of stuck with some random actions
-        if self.stuck_count > 5:
+        if self.stuck_count > 3:
             print("Warning: agent is stuck, try to get out of stuck...")
             short_term_goal = self.getout_stuck(obstacle_map, start)
             closest_goal_map = None
@@ -393,16 +403,10 @@ class DiscretePlanner:
 
         # for object goal, we relax the planner if we cannot reach the goal
         if no_path_found and not stop:
-            # Clean collision map
-            self.collision_map *= 0
             # Reduce obstacle dilation
             while self.curr_obs_dilation_selem_radius > self.min_obs_dilation_selem_radius:
-                self.curr_obs_dilation_selem_radius -= 1
-                self.obs_dilation_selem = skimage.morphology.disk(
-                    self.curr_obs_dilation_selem_radius
-                )
-                if debug:
-                    print(
+                self.relax_goal_tolerance()
+                print(
                         f"Re-planning for object goal, reduced obs dilation to {self.curr_obs_dilation_selem_radius}"
                     )
 
@@ -421,9 +425,6 @@ class DiscretePlanner:
                     planning_window,
                     is_ur_goal=not found_goal,
                 )
-                if debug:
-                    print("--- after replanning ---")
-                    print("goal =", short_term_goal)
                     
                 if not no_path_found:
                     break
@@ -431,18 +432,17 @@ class DiscretePlanner:
             if no_path_found:
                 if found_goal:
                     print('Cannot go to object goal even after replanning. Relax goal tolerance')
-                    self.relax_goal_tolerance()
                 else:
                     # if we still cannot find a path, we try to get out of stuck by moving to some random navigable area
                     print("Cannot go to ur goal even after replanning. Try some random actions")
                 short_term_goal = self.getout_stuck(obstacle_map, start)
                 closest_goal_map = None
-                no_path_found, stop = False, False
+                stop = False
                 closest_goal_pt = None
                 dilated_obstacles = None
                 reach_hgoal = False
                 replan_hgoal = True
-                getting_out = True
+                # getting_out = True
 
         # Normalize agent angle
         angle_agent = pu.normalize_angle(start_o)
@@ -518,7 +518,7 @@ class DiscretePlanner:
         self.last_action = action
         self.last_step_getting_out = getting_out
         
-        if self.stuck_count > 30:
+        if self.stuck_count > 40:
             action = DiscreteNavigationAction.STOP
             end_episode = True
             print("Warning: agent is stuck, stop the episode")
@@ -627,10 +627,7 @@ class DiscretePlanner:
         else:
             # Try to orient towards the goal object - or at least any point sampled from the goal
             # object.
-            if debug:
-                print()
-                print("----------------------------")
-                print(">>> orient towards the goal:", relative_angle_to_closest_goal)
+            print(">>> orient towards the goal:", relative_angle_to_closest_goal)
             if self.discrete_actions:
                 if relative_angle_to_closest_goal > 2 * self.turn_angle / 3.0:
                     action = DiscreteNavigationAction.TURN_RIGHT
@@ -641,8 +638,7 @@ class DiscretePlanner:
             elif (
                 np.abs(relative_angle_to_closest_goal) > self.continuous_angle_tolerance
             ):
-                if debug:
-                    print("Continuous rotation towards goal point")
+                print("Continuous rotation towards goal point")
                 relative_angle_to_closest_goal = math.radians(
                     relative_angle_to_closest_goal
                 )
@@ -651,8 +647,7 @@ class DiscretePlanner:
                 )
             else:
                 action = DiscreteNavigationAction.STOP
-                if debug:
-                    print("!!! DONE !!!")
+                print("!!! DONE !!!")
 
         return action
 

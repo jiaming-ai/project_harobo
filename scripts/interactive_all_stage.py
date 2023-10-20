@@ -49,8 +49,13 @@ from utils.visualization import (
     draw_top_down_map, 
     Recording, 
     visualize_gt,
+    show_points_with_prob,
+    render_plt_image,
     visualize_pred,
-    save_img_tensor)
+    show_points, 
+    show_voxel_with_prob, 
+    show_voxel_with_logit,
+    save_img_tensor)    
 import torch
 import random
 # NON_SCALAR_METRICS = {"top_down_map", "collisions.is_collision"}
@@ -301,7 +306,9 @@ class InteractiveEvaluator():
             # print(f'Current pose: {ob.gps*100}, theta: {ob.compass*180/np.pi}')
             start_time = time.time()
             err_msg = None
+            # print('before:',ob.gps, ob.compass*180/np.pi)
             action, agent_info, _ = agent.act(ob)
+            # print('after:',ob.gps, ob.compass*180/np.pi)
             # try:
             #     action, agent_info, _ = agent.act(ob)
             # except Exception:
@@ -389,6 +396,8 @@ class InteractiveEvaluator():
                 recorder.add_frame(draw_ob)
 
             if not self.args.no_render:
+                print(ob.gps, ob.compass*180/np.pi)
+                # print(f'Arm extension: {ob.joint[:4].sum()}, Arm height: {ob.joint[4]}')
                 user_action = self.viewer.imshow(
                     draw_ob, delay=0 if not self.args.no_interactive else 2
                 )
@@ -399,6 +408,7 @@ class InteractiveEvaluator():
                 action = user_action['action']
 
            
+            # agent.place_policy.add_rec_points(ob,trans_global=True,filter_mask=False)
             if isinstance(action, ContinuousNavigationAction):
                 print(f'Continuous action: {action.xyt}')
             else:
@@ -516,7 +526,7 @@ if __name__ == "__main__":
         "--eval_eps",
         help="evaluate a subset of episodes",
         nargs="+",
-        default=[193],
+        default=[193] #[903]#[193]#,816,900,880,1105],
     )
     parser.add_argument(
         "--eval_eps_total_num",

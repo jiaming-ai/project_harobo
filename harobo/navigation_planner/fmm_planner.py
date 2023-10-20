@@ -290,6 +290,8 @@ class FMMPlanner:
         Find the nearest point to a goal which is traversible
         """
 
+        if distance == 0:
+            return goal
         if vis_dir is not None:
             self.vis_dir = vis_dir
         planner = FMMPlanner(
